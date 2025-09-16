@@ -1,3 +1,4 @@
+import sys
 import cv2
 import dlib
 import numpy as np
@@ -6,16 +7,46 @@ from TTS.api import TTS
 import threading
 import os
 import time
-from picamera2 import Picamera2
 
-# ✅ Initialize Picamera2
-picam2 = Picamera2()
-config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
-picam2.configure(config)
-picam2.start()
+# Add system packages path for picamera2
+sys.path.append('/usr/lib/python3/dist-packages')
+
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    print("Error: picamera2 not found. Please install with:")
+    print("sudo apt install python3-picamera2")
+    sys.exit(1)
+
+# ✅ Initialize Picamera2 with error handling
+try:
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(
+        main={"format": "RGB888", "size": (640, 480)},
+        display="main"
+    )
+    picam2.configure(config)
+    picam2.start()
+    
+    # Allow camera to warm up
+    time.sleep(2)
+    print("[INFO] Camera initialized successfully")
+    
+except Exception as e:
+    print(f"[ERROR] Camera initialization failed: {e}")
+    print("Make sure:")
+    print("1. Camera is enabled: sudo raspi-config > Interface Options > Camera")
+    print("2. picamera2 is installed: sudo apt install python3-picamera2")
+    print("3. You have proper permissions")
+    sys.exit(1)
 
 # ✅ Use English-only Coqui TTS model
-tts = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=False)
+try:
+    tts = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=False)
+    print("[INFO] TTS model loaded successfully")
+except Exception as e:
+    print(f"[ERROR] TTS initialization failed: {e}")
+    sys.exit(1)
 
 # Pick male-like speaker (check available with: print(tts.speakers))
 SPEAKER = "p229"   # male-sounding voice
@@ -24,27 +55,40 @@ def speak(texts):
     """Speak a list of texts asynchronously using Coqui TTS"""
     def run_tts():
         for text in texts:
-            tts.tts_to_file(
-                text=text,
-                file_path="output.wav",
-                speaker=SPEAKER,
-                speed=0.9   # adjust speaking speed
-            )
-            if os.name == "posix":  # Linux / Mac
-                os.system("aplay output.wav")
-            else:  # Windows
-                os.system("start output.wav")
+            try:
+                tts.tts_to_file(
+                    text=text,
+                    file_path="output.wav",
+                    speaker=SPEAKER,
+                    speed=0.9   # adjust speaking speed
+                )
+                if os.name == "posix":  # Linux / Mac
+                    os.system("aplay output.wav")
+                else:  # Windows
+                    os.system("start output.wav")
+            except Exception as e:
+                print(f"[ERROR] TTS failed: {e}")
     threading.Thread(target=run_tts, daemon=True).start()
 
-
 # 📂 Load face embeddings
-features_csv = "data/features_all.csv"
-df = pd.read_csv(features_csv, index_col=0)
+try:
+    features_csv = "data/features_all.csv"
+    df = pd.read_csv(features_csv, index_col=0)
+    print(f"[INFO] Loaded {len(df)} face embeddings")
+except Exception as e:
+    print(f"[ERROR] Failed to load face embeddings: {e}")
+    sys.exit(1)
 
 # 🤖 Load models
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("data_dlib/shape_predictor_68_face_landmarks.dat")
-facerec = dlib.face_recognition_model_v1("data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+try:
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor("data_dlib/shape_predictor_68_face_landmarks.dat")
+    facerec = dlib.face_recognition_model_v1("data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+    print("[INFO] Face recognition models loaded successfully")
+except Exception as e:
+    print(f"[ERROR] Failed to load dlib models: {e}")
+    print("Make sure the model files exist in data_dlib/ directory")
+    sys.exit(1)
 
 print("[INFO] Starting real-time recognition with PiCamera2...")
 
@@ -67,89 +111,120 @@ cv2.setMouseCallback("Welcome Screen", mouse_click)
 alpha = 0.0
 fade_in = True
 last_fade = time.time()
+frame_count = 0
 
-while True:
-    # Capture frame from PiCamera2
-    frame = picam2.capture_array()
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    faces = detector(frame_rgb, 0)
+try:
+    while True:
+        try:
+            # Capture frame from PiCamera2
+            frame = picam2.capture_array()
+            frame_count += 1
+            
+            # Convert RGB to BGR for OpenCV processing
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Use RGB for dlib processing (dlib expects RGB)
+            frame_rgb = frame  # picamera2 already gives RGB
+            
+            faces = detector(frame_rgb, 0)
 
-    welcome_texts = []
+            welcome_texts = []
 
-    if len(faces) == 0:
-        welcome_texts.append("Avinya")
+            if len(faces) == 0:
+                welcome_texts.append("Avinya")
 
-    for face in faces:
-        shape = predictor(frame_rgb, face)
-        face_descriptor = facerec.compute_face_descriptor(frame_rgb, shape)
-        face_descriptor = np.array(face_descriptor)
+            for face in faces:
+                shape = predictor(frame_rgb, face)
+                face_descriptor = facerec.compute_face_descriptor(frame_rgb, shape)
+                face_descriptor = np.array(face_descriptor)
 
-        # Compare with dataset
-        distances = []
-        for i in range(len(df)):
-            person_name = df.index[i]
-            person_features = np.array(df.iloc[i].values)
-            dist = np.linalg.norm(person_features - face_descriptor)
-            distances.append((person_name, dist))
+                # Compare with dataset
+                distances = []
+                for i in range(len(df)):
+                    person_name = df.index[i]
+                    person_features = np.array(df.iloc[i].values)
+                    dist = np.linalg.norm(person_features - face_descriptor)
+                    distances.append((person_name, dist))
 
-        best_match = min(distances, key=lambda x: x[1])
-        name, min_dist = best_match
+                best_match = min(distances, key=lambda x: x[1])
+                name, min_dist = best_match
 
-        if min_dist < 0.6:
-            text = f"{name} ({min_dist:.2f})"
-            welcome_texts.append(f"Welcome {name}")
-        else:
-            text = "Unknown"
-            welcome_texts.append("Welcome Participant")
+                if min_dist < 0.6:
+                    text = f"{name} ({min_dist:.2f})"
+                    welcome_texts.append(f"Welcome {name}")
+                else:
+                    text = "Unknown"
+                    welcome_texts.append("Welcome Participant")
 
-        cv2.rectangle(frame, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
-        cv2.putText(frame, text, (face.left(), face.top() - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                # Draw on BGR frame for display
+                cv2.rectangle(frame_bgr, (face.left(), face.top()), (face.right(), face.bottom()), (0, 255, 0), 2)
+                cv2.putText(frame_bgr, text, (face.left(), face.top() - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # 🎯 First canvas (face recognition)
-    cv2.imshow("Face Recognition", frame)
+            # Add frame counter
+            cv2.putText(frame_bgr, f"Frame: {frame_count}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    # 🎯 Second canvas (Welcome Screen)
-    welcome_canvas = np.zeros((600, 800, 3), dtype=np.uint8)
+            # 🎯 First canvas (face recognition)
+            cv2.imshow("Face Recognition", frame_bgr)
 
-    # Handle fading effect only for "Avinya"
-    if "Avinya" in welcome_texts:
-        if time.time() - last_fade > 0.05:
-            if fade_in:
-                alpha += 0.05
-                if alpha >= 1.0:
-                    fade_in = False
+            # 🎯 Second canvas (Welcome Screen)
+            welcome_canvas = np.zeros((600, 800, 3), dtype=np.uint8)
+
+            # Handle fading effect only for "Avinya"
+            if "Avinya" in welcome_texts:
+                if time.time() - last_fade > 0.05:
+                    if fade_in:
+                        alpha += 0.05
+                        if alpha >= 1.0:
+                            fade_in = False
+                    else:
+                        alpha -= 0.05
+                        if alpha <= 0.0:
+                            fade_in = True
+                    last_fade = time.time()
+
+                overlay = welcome_canvas.copy()
+                cv2.putText(overlay, "Avinya", (80, 200),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4, cv2.LINE_AA)
+                cv2.addWeighted(overlay, alpha, welcome_canvas, 1 - alpha, 0, welcome_canvas)
+                welcome_texts.remove("Avinya")  # prevent duplicate
             else:
-                alpha -= 0.05
-                if alpha <= 0.0:
-                    fade_in = True
-            last_fade = time.time()
+                alpha = 0.0  # reset
 
-        overlay = welcome_canvas.copy()
-        cv2.putText(overlay, "Avinya", (80, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4, cv2.LINE_AA)
-        cv2.addWeighted(overlay, alpha, welcome_canvas, 1 - alpha, 0, welcome_canvas)
-        welcome_texts.remove("Avinya")  # prevent duplicate
-    else:
-        alpha = 0.0  # reset
+            # Draw other welcome texts
+            y = 200
+            for msg in welcome_texts:
+                cv2.putText(welcome_canvas, msg, (80, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4, cv2.LINE_AA)
+                y += 80
 
-    # Draw other welcome texts
-    y = 200
-    for msg in welcome_texts:
-        cv2.putText(welcome_canvas, msg, (80, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4, cv2.LINE_AA)
-        y += 80
+            # Draw Speak button
+            x1, y1, x2, y2 = button_coords
+            cv2.rectangle(welcome_canvas, (x1, y1), (x2, y2), (0, 255, 0), -1)
+            cv2.putText(welcome_canvas, "SPEAK", (x1 + 30, y1 + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3, cv2.LINE_AA)
 
-    # Draw Speak button
-    x1, y1, x2, y2 = button_coords
-    cv2.rectangle(welcome_canvas, (x1, y1), (x2, y2), (0, 255, 0), -1)
-    cv2.putText(welcome_canvas, "SPEAK", (x1 + 30, y1 + 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.imshow("Welcome Screen", welcome_canvas)
 
-    cv2.imshow("Welcome Screen", welcome_canvas)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("[INFO] Quitting...")
+                break
+                
+        except Exception as e:
+            print(f"[ERROR] Frame processing error: {e}")
+            continue
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-picam2.stop()
-cv2.destroyAllWindows()
+except KeyboardInterrupt:
+    print("\n[INFO] Interrupted by user")
+except Exception as e:
+    print(f"[ERROR] Unexpected error: {e}")
+finally:
+    # Cleanup
+    try:
+        picam2.stop()
+        print("[INFO] Camera stopped")
+    except:
+        pass
+    cv2.destroyAllWindows()
+    print("[INFO] Windows closed")
