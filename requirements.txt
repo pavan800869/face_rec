@@ -8,10 +8,10 @@ pandas==2.2.3
 
 # Text-to-Speech
 TTS==0.22.0
-pyttsx3==2.98
+pyttsx3==2.90
 
 # Camera (Raspberry Pi)
-picamera2==0.3.19
+picamera2==0.3.18
 
 # Core dependencies (automatically managed, but specified for consistency)
 python-dateutil==2.9.0.post0
