@@ -1,13 +1,22 @@
-dlib==20.0.0
-numpy==2.2.6
-opencv-python==4.12.0.88
-pandas==2.2.2
-python-dateutil==2.9.0.post0
-pytz==2025.2
-setuptools==80.9.0
-six==1.17.0
-tzdata==2025.2
-wheel==0.45.1
+# Computer Vision and Image Processing
+dlib==19.24.6
+opencv-python==4.10.0.84
+numpy==1.26.4
+
+# Data Processing
+pandas==2.2.3
+
+# Text-to-Speech
 TTS==0.22.0
-pyttsx3==2.90
-picamera2
+pyttsx3==2.98
+
+# Camera (Raspberry Pi)
+picamera2==0.3.19
+
+# Core dependencies (automatically managed, but specified for consistency)
+python-dateutil==2.9.0.post0
+pytz==2024.2
+six==1.16.0
+tzdata==2024.2
+setuptools==75.1.0
+wheel==0.44.0
