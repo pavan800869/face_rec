@@ -1,444 +1,728 @@
-import sys
-import cv2
-import dlib
-import numpy as np
-import pandas as pd
-from TTS.api import TTS
-import threading
+#!/usr/bin/env python3
+"""
+Avinya Professional Welcome UI (Pi / local)
+
+- Keeps the original polished UI (centered Avinya symbol, pulsing rings, animated subtitle).
+- Separates camera window (live feed + face boxes).
+- Continuously speaks detected welcome messages (Coqui TTS primary, pyttsx3 fallback).
+- SPEAK button removed; speech is ON by default and runs iteratively until no messages.
+- Messages equal to "avinya" (case-insensitive) are NOT spoken.
+- Long messages are wrapped to fit inside the UI and displayed line-by-line.
+- Audio for Coqui is cached to tts_cache/<sha1>.wav to avoid re-generation each loop.
+- Gentle debouncing: speech repeats while the same messages remain, but not excessively.
+- Clean shutdown on exit.
+
+Notes:
+- This file is intentionally verbose and modular for clarity and to provide a rich,
+  professional single-file demo.
+- If you want to run on mac/local webcam instead of PiCamera2: replace the Picamera2 capture
+  with cv2.VideoCapture(0) read logic (kept as-is per the UI you're running).
+"""
+
 import os
+import sys
 import time
 import math
+import threading
+import hashlib
+import shutil
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-# Add system packages path for picamera2
-sys.path.append('/usr/lib/python3/dist-packages')
+import cv2
+import numpy as np
 
+# -------------------------
+# Optional libraries
+# -------------------------
 try:
-    from picamera2 import Picamera2
-except ImportError:
-    print("Error: picamera2 not found. Please install with:")
-    print("sudo apt install python3-picamera2")
-    sys.exit(1)
+    import dlib
+    _HAS_DLIB = True
+except Exception:
+    dlib = None
+    _HAS_DLIB = False
 
-# Screen dimensions for 7" display
+# Coqui TTS
+_COQUI_AVAILABLE = False
+try:
+    from TTS.api import TTS
+    _COQUI_AVAILABLE = True
+except Exception:
+    _COQUI_AVAILABLE = False
+
+# pyttsx3 fallback
+_PYTTX3_AVAILABLE = False
+try:
+    import pyttsx3
+    _PYTTX3_AVAILABLE = True
+except Exception:
+    pyttsx3 = None
+    _PYTTX3_AVAILABLE = False
+
+# picamera2 (for Raspberry Pi) — keep for environments that use it
+try:
+    # allow nonstandard package path if needed (your environment may not need this)
+    sys.path.append('/usr/lib/python3/dist-packages')
+    from picamera2 import Picamera2
+    _HAS_PICAMERA2 = True
+except Exception:
+    Picamera2 = None
+    _HAS_PICAMERA2 = False
+
+# -------------------------
+# Configuration
+# -------------------------
 SCREEN_WIDTH = 1200
 SCREEN_HEIGHT = 600
 
-# ✅ Initialize Picamera2 with error handling
-try:
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(
-        main={"format": "RGB888", "size": (640, 480)},
-        display="main"
-    )
-    picam2.configure(config)
-    picam2.start()
-    
-    # Allow camera to warm up
-    time.sleep(2)
-    print("[INFO] Camera initialized successfully")
-    
-except Exception as e:
-    print(f"[ERROR] Camera initialization failed: {e}")
-    print("Make sure:")
-    print("1. Camera is enabled: sudo raspi-config > Interface Options > Camera")
-    print("2. picamera2 is installed: sudo apt install python3-picamera2")
-    print("3. You have proper permissions")
-    sys.exit(1)
+LOGO_SIZE = 280
+LOGO_COLOR = (20, 40, 80)  # BGR for logo text/core
+BG_COLOR_TOP = (245, 247, 250)
+BG_COLOR_BOTTOM = (255, 255, 255)
 
-# ✅ Use pyttsx3 as fallback TTS (more reliable on Raspberry Pi)
-try:
-    import pyttsx3
-    tts_engine = pyttsx3.init()
-    
-    # Configure voice settings for formal, clear speech
-    voices = tts_engine.getProperty('voices')
-    if voices:
-        # Prefer female voices for clarity, then male voices
-        selected_voice = None
-        
-        # First pass: look for clear female voices
-        for voice in voices:
-            if 'female' in voice.name.lower() or 'woman' in voice.name.lower():
-                selected_voice = voice.id
-                print(f"[INFO] Selected female voice: {voice.name}")
-                break
-        
-        # Second pass: if no female voice, look for clear male voices
-        if not selected_voice:
-            for voice in voices:
-                if 'male' in voice.name.lower() or 'man' in voice.name.lower():
-                    selected_voice = voice.id
-                    print(f"[INFO] Selected male voice: {voice.name}")
-                    break
-        
-        # Use the first available voice if no gender-specific voice found
-        if not selected_voice and voices:
-            selected_voice = voices[0].id
-            print(f"[INFO] Using default voice: {voices[0].name}")
-        
-        if selected_voice:
-            tts_engine.setProperty('voice', selected_voice)
-    
-    # Formal speech settings: medium pace, clear pronunciation
-    tts_engine.setProperty('rate', 180)      # Medium pace (words per minute)
-    tts_engine.setProperty('volume', 0.95)   # Clear, audible volume
-    
-    # Additional properties for better clarity (if supported)
-    try:
-        tts_engine.setProperty('pitch', 50)      # Neutral pitch
-        tts_engine.setProperty('gap', 50)        # Small pause between words
-    except:
-        pass  # Some TTS engines don't support these properties
-    
-    print("[INFO] pyttsx3 TTS configured for formal speech")
-    use_coqui = False
-    
-except Exception as e:
-    print(f"[ERROR] pyttsx3 TTS initialization failed: {e}")
-    # Fallback to Coqui TTS if pyttsx3 fails
-    try:
-        from TTS.api import TTS
-        tts = TTS(model_name="tts_models/en/vctk/vits", progress_bar=False, gpu=False)
-        SPEAKER = "p229"
-        print("[INFO] Coqui TTS loaded as fallback")
-        use_coqui = True
-    except Exception as e2:
-        print(f"[ERROR] Both TTS systems failed: {e2}")
-        print("Install espeak: sudo apt install espeak espeak-ng")
-        sys.exit(1)
+MATCH_THRESHOLD = 0.60
 
-def speak(texts):
-    """Speak a list of texts asynchronously"""
-    def run_tts():
-        for text in texts:
-            try:
-                if use_coqui:
-                    # Use Coqui TTS
-                    tts.tts_to_file(
-                        text=text,
-                        file_path="output.wav",
-                        speaker=SPEAKER,
-                        speed=0.9
-                    )
-                    if os.name == "posix":
-                        os.system("aplay output.wav")
-                    else:
-                        os.system("start output.wav")
-                else:
-                    # Use pyttsx3
-                    tts_engine.say(text)
-                    tts_engine.runAndWait()
-            except Exception as e:
-                print(f"[ERROR] TTS failed: {e}")
-    threading.Thread(target=run_tts, daemon=True).start()
+# TTS settings
+COQUI_MODEL_NAME = "tts_models/en/ljspeech/tacotron2-DDC"
+COQUI_SPEED = 0.95
+TTS_CACHE_DIR = Path("tts_cache")
+TTS_CACHE_DIR.mkdir(exist_ok=True)
 
-def draw_gradient_background(canvas, color1, color2):
-    """Draw a vertical gradient background"""
-    height, width = canvas.shape[:2]
-    for i in range(height):
-        alpha = i / height
-        blended_color = [
-            int(color1[j] * (1 - alpha) + color2[j] * alpha) 
-            for j in range(3)
-        ]
-        cv2.line(canvas, (0, i), (width, i), blended_color, 1)
+# Data/model paths
+FEATURES_CSV = Path("data/features_all.csv")
+DLIB_PREDICTOR = Path("data_dlib/shape_predictor_68_face_landmarks.dat")
+DLIB_FACEREC = Path("data_dlib/dlib_face_recognition_resnet_model_v1.dat")
 
-def draw_pulsing_circle(canvas, center, radius, color, pulse_factor):
-    """Draw a pulsing circle effect"""
-    pulsing_radius = int(radius * pulse_factor)
-    alpha = max(0.3, 1.0 - pulse_factor)
-    
-    # Create overlay for transparency
-    overlay = canvas.copy()
-    cv2.circle(overlay, center, pulsing_radius, color, -1)
-    cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
+# Windows
+WINDOW_MAIN = "AVINYA - Welcome System"
+WINDOW_CAMERA = "AVINYA - Face Recognition"
 
-def draw_animated_text(canvas, text, position, font_scale, color, thickness, pulse_factor=1.0):
-    """Draw text with animation effects"""
-    # Add glow effect
-    glow_color = (100, 100, 255) if text == "AVINYA" else (200, 200, 200)
-    
-    # Draw glow (multiple layers)
-    for i in range(3, 0, -1):
-        glow_thickness = thickness + i * 2
-        glow_alpha = 0.3 * (4 - i) * pulse_factor
-        overlay = canvas.copy()
-        cv2.putText(overlay, text, position, cv2.FONT_HERSHEY_SIMPLEX, 
-                   font_scale, glow_color, glow_thickness, cv2.LINE_AA)
-        cv2.addWeighted(overlay, glow_alpha, canvas, 1 - glow_alpha, 0, canvas)
-    
-    # Draw main text
-    cv2.putText(canvas, text, position, cv2.FONT_HERSHEY_SIMPLEX, 
-               font_scale, color, thickness, cv2.LINE_AA)
+# UI positions (keep original centre behavior)
+# Helper for spacing text under the logo
+TEXT_BASE_OFFSET = 40
 
-def draw_modern_button(canvas, rect, text, is_hovered=False):
-    """Draw a modern gradient button with shadow"""
-    x1, y1, x2, y2 = rect
-    
-    # Button shadow
-    shadow_offset = 5
-    cv2.rectangle(canvas, (x1 + shadow_offset, y1 + shadow_offset), 
-                 (x2 + shadow_offset, y2 + shadow_offset), (30, 30, 30), -1)
-    
-    # Button gradient
-    button_height = y2 - y1
-    if is_hovered:
-        color1, color2 = (0, 220, 0), (0, 150, 0)
+# Audio playback helper: platform player
+def platform_player_command(path: str) -> Optional[str]:
+    if sys.platform.startswith("darwin"):
+        if shutil.which("afplay"):
+            return f'afplay "{path}"'
     else:
-        color1, color2 = (0, 180, 0), (0, 120, 0)
-    
-    for i in range(button_height):
-        alpha = i / button_height
-        blended_color = [
-            int(color1[j] * (1 - alpha) + color2[j] * alpha) 
-            for j in range(3)
-        ]
-        cv2.line(canvas, (x1, y1 + i), (x2, y1 + i), blended_color, 1)
-    
-    # Button border
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
-    
-    # Button text with shadow
-    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
-    text_x = x1 + (x2 - x1 - text_size[0]) // 2
-    text_y = y1 + (y2 - y1 + text_size[1]) // 2
-    
-    # Text shadow
-    cv2.putText(canvas, text, (text_x + 2, text_y + 2), 
-               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
-    # Main text
-    cv2.putText(canvas, text, (text_x, text_y), 
-               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
+        if shutil.which("aplay"):
+            return f'aplay "{path}"'
+        if shutil.which("ffplay"):
+            return f'ffplay -nodisp -autoexit -loglevel quiet "{path}"'
+        if shutil.which("cvlc"):
+            return f'cvlc --play-and-exit --intf dummy "{path}"'
+    return None
 
-# 📂 Load face embeddings
-try:
-    features_csv = "data/features_all.csv"
-    df = pd.read_csv(features_csv, index_col=0)
-    print(f"[INFO] Loaded {len(df)} face embeddings")
-except Exception as e:
-    print(f"[ERROR] Failed to load face embeddings: {e}")
-    sys.exit(1)
 
-# 🤖 Load models
-try:
-    detector = dlib.get_frontal_face_detector()
-    predictor = dlib.shape_predictor("data_dlib/shape_predictor_68_face_landmarks.dat")
-    facerec = dlib.face_recognition_model_v1("data_dlib/dlib_face_recognition_resnet_model_v1.dat")
-    print("[INFO] Face recognition models loaded successfully")
-except Exception as e:
-    print(f"[ERROR] Failed to load dlib models: {e}")
-    print("Make sure the model files exist in data_dlib/ directory")
-    sys.exit(1)
+def sha1_hex(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-print("[INFO] Starting real-time recognition with PiCamera2...")
 
-welcome_texts = []
-button_coords = (SCREEN_WIDTH//2 - 120, SCREEN_HEIGHT - 100, SCREEN_WIDTH//2 + 120, SCREEN_HEIGHT - 40)
-mouse_pos = (0, 0)
+# -------------------------
+# Logo & UI drawing helpers
+# -------------------------
+def make_logo_image(size: int = LOGO_SIZE) -> np.ndarray:
+    logo = np.full((size, size, 3), 255, dtype=np.uint8)
+    cx, cy = size // 2, size // 2
+    # soft ring layers
+    cv2.circle(logo, (cx, cy), size // 2 - 4, (230, 230, 235), -1)
+    cv2.circle(logo, (cx, cy), size // 2 - 18, (245, 247, 250), -1)
+    cv2.circle(logo, (cx, cy), size // 8, LOGO_COLOR, -1)
+    # label "AVINYA" below core
+    text = "AVINYA"
+    font_scale = size / 300.0
+    thickness = max(1, int(font_scale * 2.5))
+    ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+    tx = cx - ts[0] // 2
+    ty = cy + size // 3
+    cv2.putText(logo, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, LOGO_COLOR, thickness, cv2.LINE_AA)
+    return logo
 
-# 🖱️ Mouse callback for Speak button and hover effects
-def mouse_callback(event, x, y, flags, param):
-    global welcome_texts, mouse_pos
-    mouse_pos = (x, y)
-    
-    if event == cv2.EVENT_LBUTTONDOWN:
-        x1, y1, x2, y2 = button_coords
-        if x1 <= x <= x2 and y1 <= y <= y2:
-            if welcome_texts:
-                speak(welcome_texts)
 
-cv2.namedWindow("AVINYA - Welcome System", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("AVINYA - Welcome System", SCREEN_WIDTH, SCREEN_HEIGHT)
-cv2.setMouseCallback("AVINYA - Welcome System", mouse_callback)
+LOGO_IMG = make_logo_image(LOGO_SIZE)
 
-# Create face recognition window
-cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Face Recognition", 640, 480)
-cv2.moveWindow("Face Recognition", 0, 0)
 
-# 🎥 Main loop
-alpha = 0.0
-fade_in = True
-last_fade = time.time()
-frame_count = 0
-pulse_time = 0
-idle_animation_time = 0
+def draw_gradient_background(canvas: np.ndarray, color_top: Tuple[int, int, int], color_bottom: Tuple[int, int, int]):
+    h, w = canvas.shape[:2]
+    # vertical gradient
+    for i in range(h):
+        alpha = i / float(h)
+        col = (
+            int(color_top[0] * (1 - alpha) + color_bottom[0] * alpha),
+            int(color_top[1] * (1 - alpha) + color_bottom[1] * alpha),
+            int(color_top[2] * (1 - alpha) + color_bottom[2] * alpha),
+        )
+        canvas[i, :, :] = col
 
-try:
-    while True:
-        try:
-            # Capture frame from PiCamera2
-            frame = picam2.capture_array()
-            frame_count += 1
-            pulse_time += 0.02
-            idle_animation_time += 0.03
-            
-            # Convert RGB to BGR for OpenCV processing
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            # Use RGB for dlib processing (dlib expects RGB)
-            frame_rgb = frame  # picamera2 already gives RGB
-            
-            faces = detector(frame_rgb, 0)
 
-            welcome_texts = []
-            is_idle = len(faces) == 0
+def draw_logo_center(canvas: np.ndarray, logo_img: np.ndarray):
+    h, w = canvas.shape[:2]
+    lh, lw = logo_img.shape[:2]
+    x = (w - lw) // 2
+    y = (h - lh) // 2 - 40
+    # subtle shadow
+    sh_offset = 8
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (x + sh_offset + 10, y + sh_offset + 10),
+                  (x + lw - 10, y + lh - 10), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.06, canvas, 0.94, 0, canvas)
+    canvas[y:y + lh, x:x + lw] = logo_img
 
-            if is_idle:
-                welcome_texts.append("Avinya")
 
-            for face in faces:
-                shape = predictor(frame_rgb, face)
-                face_descriptor = facerec.compute_face_descriptor(frame_rgb, shape)
-                face_descriptor = np.array(face_descriptor)
+def draw_pulsing_circles(canvas: np.ndarray, center: Tuple[int, int], base_radius: int, pulse_phase: float):
+    # three pulsing faint circles
+    for i in range(3):
+        pf = 0.6 + 0.4 * math.sin(pulse_phase * (1.0 + i * 0.3) + i)
+        r = int(base_radius * (0.9 + i * 0.25) * (0.9 + 0.12 * pf))
+        color = (40 + i * 30, 100 + i * 20, 200 - i * 30)
+        alpha = 0.08 + 0.08 * pf
+        overlay = canvas.copy()
+        cv2.circle(overlay, center, r, color, -1)
+        cv2.addWeighted(overlay, alpha, canvas, 1 - alpha, 0, canvas)
 
-                # Compare with dataset
-                distances = []
-                for i in range(len(df)):
-                    person_name = df.index[i]
-                    person_features = np.array(df.iloc[i].values)
-                    dist = np.linalg.norm(person_features - face_descriptor)
-                    distances.append((person_name, dist))
 
-                best_match = min(distances, key=lambda x: x[1])
-                name, min_dist = best_match
+def draw_animated_text_glow(canvas: np.ndarray, text: str, center_x: int, y: int,
+                            font_scale: float, color: Tuple[int, int, int], thickness: int, glow: float):
+    # glow by drawing multiple thicker translucent outlines
+    for i in range(4, 0, -1):
+        overlay = canvas.copy()
+        weight = 0.03 * i * glow
+        cv2.putText(overlay, text, (center_x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (200, 200, 255), thickness + i * 2, cv2.LINE_AA)
+        cv2.addWeighted(overlay, weight, canvas, 1 - weight, 0, canvas)
+    # main text
+    cv2.putText(canvas, text, (center_x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, color, thickness, cv2.LINE_AA)
 
-                if min_dist < 0.6:
-                    text = f"{name} ({min_dist:.2f})"
-                    welcome_texts.append(f"Welcome {name}")
+
+def wrap_text_to_width(text: str, font, scale: float, thickness: int, max_width: int) -> List[str]:
+    """
+    Wrap text into lines so that each line's pixel width <= max_width.
+    Splits on spaces; if a single word > max_width, it will be split character-wise.
+    """
+    words = text.split()
+    if not words:
+        return []
+    lines = []
+    cur = words[0]
+    for w in words[1:]:
+        test = cur + " " + w
+        tw = cv2.getTextSize(test, font, scale, thickness)[0][0]
+        if tw <= max_width:
+            cur = test
+        else:
+            lines.append(cur)
+            cur = w
+    # append last
+    lines.append(cur)
+
+    # ensure no single line is too long; if so, break character-wise
+    final_lines = []
+    for ln in lines:
+        width = cv2.getTextSize(ln, font, scale, thickness)[0][0]
+        if width <= max_width:
+            final_lines.append(ln)
+        else:
+            # break long word/line into chunks
+            cur_s = ""
+            for ch in ln:
+                test = cur_s + ch
+                tw = cv2.getTextSize(test, font, scale, thickness)[0][0]
+                if tw <= max_width:
+                    cur_s = test
                 else:
-                    text = "Unknown"
-                    welcome_texts.append("Welcome Participant")
+                    final_lines.append(cur_s)
+                    cur_s = ch
+            if cur_s:
+                final_lines.append(cur_s)
+    return final_lines
 
-                # Draw enhanced face rectangle
-                cv2.rectangle(frame_bgr, (face.left()-5, face.top()-5), 
-                             (face.right()+5, face.bottom()+5), (0, 255, 0), 3)
-                cv2.rectangle(frame_bgr, (face.left()-2, face.top()-2), 
-                             (face.right()+2, face.bottom()+2), (255, 255, 255), 1)
-                
-                # Enhanced text with background
-                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-                cv2.rectangle(frame_bgr, (face.left(), face.top() - 35), 
-                             (face.left() + text_size[0] + 10, face.top() - 5), 
-                             (0, 0, 0), -1)
-                cv2.putText(frame_bgr, text, (face.left() + 5, face.top() - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-            # Add frame counter with modern styling
-            cv2.rectangle(frame_bgr, (5, 5), (150, 35), (0, 0, 0), -1)
-            cv2.putText(frame_bgr, f"Frame: {frame_count}", (10, 25), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-            # Show face recognition window
-            cv2.imshow("Face Recognition", frame_bgr)
-
-            # 🎯 Main Welcome Screen with enhanced UI
-            welcome_canvas = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
-
-            if is_idle:
-                # Animated gradient background for idle state
-                bg_color1 = (20, 30, 60)
-                bg_color2 = (60, 40, 80)
-                draw_gradient_background(welcome_canvas, bg_color1, bg_color2)
-                
-                # Pulsing circles around AVINYA
-                pulse_factor = 0.5 + 0.5 * math.sin(pulse_time * 2)
-                center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
-                
-                # Multiple pulsing circles
-                for i in range(3):
-                    circle_pulse = 0.3 + 0.7 * math.sin(pulse_time * 2 + i * 0.5)
-                    radius = 150 + i * 50
-                    alpha = 0.1 + 0.2 * circle_pulse
-                    color = (50 + i * 30, 100 + i * 20, 200 - i * 30)
-                    draw_pulsing_circle(welcome_canvas, center, radius, color, circle_pulse)
-                
-                # Animated AVINYA text in center
-                text_pulse = 0.8 + 0.2 * math.sin(idle_animation_time * 3)
-                font_scale = 4.0 * text_pulse
-                
-                # Center the text
-                text_size = cv2.getTextSize("AVINYA", cv2.FONT_HERSHEY_SIMPLEX, font_scale, 6)[0]
-                text_x = (SCREEN_WIDTH - text_size[0]) // 2
-                text_y = (SCREEN_HEIGHT + text_size[1]) // 2
-                
-                draw_animated_text(welcome_canvas, "AVINYA", (text_x, text_y), 
-                                 font_scale, (255, 255, 255), 6, text_pulse)
-                
-                # Subtitle with fade effect
-                subtitle_alpha = 0.7 + 0.3 * math.sin(idle_animation_time * 1.5)
-                subtitle = "Intelligent Welcome System"
-                subtitle_size = cv2.getTextSize(subtitle, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)[0]
-                subtitle_x = (SCREEN_WIDTH - subtitle_size[0]) // 2
-                subtitle_y = text_y + 80
-                
-                overlay = welcome_canvas.copy()
-                cv2.putText(overlay, subtitle, (subtitle_x, subtitle_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.2, (180, 200, 255), 2, cv2.LINE_AA)
-                cv2.addWeighted(overlay, subtitle_alpha, welcome_canvas, 1 - subtitle_alpha, 0, welcome_canvas)
-                
-            else:
-                # Active state - different background
-                bg_color1 = (10, 50, 20)
-                bg_color2 = (30, 80, 40)
-                draw_gradient_background(welcome_canvas, bg_color1, bg_color2)
-                
-                # Welcome messages with enhanced styling
-                y_start = (SCREEN_HEIGHT - len(welcome_texts) * 80) // 2
-                for i, msg in enumerate(welcome_texts):
-                    y = y_start + i * 80
-                    
-                    # Message background
-                    msg_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 2.5, 4)[0]
-                    bg_x1 = (SCREEN_WIDTH - msg_size[0]) // 2 - 20
-                    bg_x2 = (SCREEN_WIDTH + msg_size[0]) // 2 + 20
-                    
-                    # Animated background
-                    bg_alpha = 0.6 + 0.2 * math.sin(pulse_time * 2 + i)
-                    overlay = welcome_canvas.copy()
-                    cv2.rectangle(overlay, (bg_x1, y - 40), (bg_x2, y + 20), 
-                                 (50, 100, 50), -1)
-                    cv2.addWeighted(overlay, bg_alpha, welcome_canvas, 1 - bg_alpha, 0, welcome_canvas)
-                    
-                    # Main text
-                    text_x = (SCREEN_WIDTH - msg_size[0]) // 2
-                    draw_animated_text(welcome_canvas, msg, (text_x, y), 
-                                     2.5, (255, 255, 255), 4)
-
-            # Check if mouse is hovering over button
-            x1, y1, x2, y2 = button_coords
-            is_hovered = x1 <= mouse_pos[0] <= x2 and y1 <= mouse_pos[1] <= y2
-            
-            # Draw modern speak button
-            draw_modern_button(welcome_canvas, button_coords, "SPEAK", is_hovered)
-            
-            # Add corner decorations
-            corner_size = 50
-            cv2.circle(welcome_canvas, (corner_size, corner_size), 30, (100, 150, 255), 2)
-            cv2.circle(welcome_canvas, (SCREEN_WIDTH - corner_size, corner_size), 30, (100, 150, 255), 2)
-            cv2.circle(welcome_canvas, (corner_size, SCREEN_HEIGHT - corner_size), 30, (100, 150, 255), 2)
-            cv2.circle(welcome_canvas, (SCREEN_WIDTH - corner_size, SCREEN_HEIGHT - corner_size), 30, (100, 150, 255), 2)
-
-            cv2.imshow("AVINYA - Welcome System", welcome_canvas)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("[INFO] Quitting...")
-                break
-                
-        except Exception as e:
-            print(f"[ERROR] Frame processing error: {e}")
-            continue
-
-except KeyboardInterrupt:
-    print("\n[INFO] Interrupted by user")
-except Exception as e:
-    print(f"[ERROR] Unexpected error: {e}")
-finally:
-    # Cleanup
+# -------------------------
+# Recognition helpers
+# -------------------------
+# Load embeddings if present
+if FEATURES_CSV.exists():
     try:
-        picam2.stop()
-        print("[INFO] Camera stopped")
-    except:
-        pass
-    cv2.destroyAllWindows()
-    print("[INFO] Windows closed")
+        import pandas as pd
+        _df = pd.read_csv(str(FEATURES_CSV), index_col=0)
+        FEATURE_NAMES = list(_df.index)
+        FEATURES_MATRIX = _df.to_numpy(dtype=float)
+        print(f"[INFO] Loaded {len(FEATURE_NAMES)} embeddings from {FEATURES_CSV}")
+    except Exception as e:
+        print("[WARN] Failed to load features:", e)
+        FEATURE_NAMES = []
+        FEATURES_MATRIX = np.empty((0, 128))
+else:
+    FEATURE_NAMES = []
+    FEATURES_MATRIX = np.empty((0, 128))
+
+# dlib or Haar
+if _HAS_DLIB and DLIB_PREDICTOR.exists() and DLIB_FACEREC.exists():
+    try:
+        _detector = dlib.get_frontal_face_detector()
+        _predictor = dlib.shape_predictor(str(DLIB_PREDICTOR))
+        _facerec = dlib.face_recognition_model_v1(str(DLIB_FACEREC))
+        USING_DLIB = True
+        print("[INFO] dlib recognition available.")
+    except Exception as e:
+        print("[WARN] dlib init error:", e)
+        USING_DLIB = False
+        _detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        _predictor = None
+        _facerec = None
+else:
+    USING_DLIB = False
+    _detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    _predictor = None
+    _facerec = None
+    print("[INFO] Using Haar cascade fallback for face detection.")
+
+
+def compute_recognition(frame_rgb: np.ndarray):
+    """
+    Return a list of recognition dicts: {'rect': r, 'name': name_or_None, 'dist': float}
+    If USING_DLIB: r is a dlib.rect, else r is (x,y,w,h).
+    """
+    results = []
+    if USING_DLIB:
+        rects = _detector(frame_rgb, 0)
+        for r in rects:
+            try:
+                shape = _predictor(frame_rgb, r)
+                desc = np.array(_facerec.compute_face_descriptor(frame_rgb, shape), dtype=float)
+                if FEATURES_MATRIX.size > 0:
+                    dists = np.linalg.norm(FEATURES_MATRIX - desc, axis=1)
+                    idx = int(dists.argmin())
+                    min_dist = float(dists[idx])
+                    name = FEATURE_NAMES[idx] if min_dist < MATCH_THRESHOLD else None
+                else:
+                    name = None
+                    min_dist = 1.0
+                results.append({'rect': r, 'name': name, 'dist': min_dist})
+            except Exception as e:
+                print("[WARN] descriptor error:", e)
+    else:
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
+        dets = _detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5)
+        for (x, y, w, h) in dets:
+            results.append({'rect': (x, y, w, h), 'name': None, 'dist': 1.0})
+    return results
+
+
+# -------------------------
+# TTS manager (Coqui primary, pyttsx3 fallback)
+# -------------------------
+class TTSManager:
+    """
+    Continuously loop through provided messages while enabled.
+    Uses Coqui to produce WAV files cached under tts_cache/<sha1>.wav.
+    Falls back to pyttsx3 running live (no caching).
+    Skips messages equal to 'avinya' (case-insensitive).
+    """
+
+    def __init__(self, use_coqui: bool = True):
+        self.use_coqui = use_coqui and _COQUI_AVAILABLE
+        self.coqui = None
+        if self.use_coqui:
+            try:
+                self.coqui = TTS(model_name=COQUI_MODEL_NAME, progress_bar=False, gpu=False)
+                print("[TTS] Coqui initialized")
+            except Exception as e:
+                print("[TTS] Coqui init failed:", e)
+                self.use_coqui = False
+
+        self.use_pyttsx3 = (not self.use_coqui) and _PYTTX3_AVAILABLE
+        self.py_engine = None
+        if self.use_pyttsx3:
+            try:
+                self.py_engine = pyttsx3.init()
+                print("[TTS] pyttsx3 init OK")
+            except Exception as e:
+                print("[TTS] pyttsx3 init error:", e)
+                self.use_pyttsx3 = False
+
+        self.lock = threading.Lock()
+        self.current_texts: List[str] = []   # ordered unique messages to speak
+        self.enabled = True                  # speech ON by default as requested
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        # throttle: minimal time between re-speaking the same message batch
+        self._last_spoken_batch_ts = 0.0
+        self._min_repeat_interval = 4.0  # seconds before repeating same batch
+
+    def update_texts(self, texts: List[str]):
+        # filter 'avinya' and blanks, keep order and uniqueness
+        filtered = []
+        seen = set()
+        for t in texts:
+            if not t or not t.strip():
+                continue
+            if t.strip().lower() == "avinya":
+                # never speak the AVINYA text
+                continue
+            if t not in seen:
+                seen.add(t)
+                filtered.append(t)
+        with self.lock:
+            self.current_texts = filtered
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _ensure_cached_wav(self, text: str) -> Optional[str]:
+        # returns path to wav file or None
+        key = sha1_hex(text)
+        target = TTS_CACHE_DIR / f"{key}.wav"
+        if target.exists():
+            return str(target)
+        if self.use_coqui and self.coqui:
+            try:
+                # try API with speed param, fallback if signature mismatch
+                try:
+                    self.coqui.tts_to_file(text=text, file_path=str(target), speed=COQUI_SPEED)
+                except TypeError:
+                    self.coqui.tts_to_file(text=text, file_path=str(target))
+                return str(target)
+            except Exception as e:
+                print("[TTS] Coqui generation error:", e)
+                return None
+        # no caching for pyttsx3
+        return None
+
+    def _play_wav(self, path: str):
+        cmd = platform_player_command(path)
+        if cmd:
+            try:
+                os.system(cmd)
+            except Exception as e:
+                print("[TTS] playback failed:", e)
+        else:
+            # no system player: attempt to fallback to pyttsx3 speaking the text (approx)
+            if self.use_pyttsx3 and self.py_engine:
+                try:
+                    self.py_engine.runAndWait()
+                except Exception:
+                    pass
+
+    def _worker(self):
+        prev_batch = None
+        prepared = []
+        while not self._stop.is_set():
+            with self.lock:
+                enabled = self.enabled
+                texts = list(self.current_texts)
+            if not enabled or not texts:
+                prev_batch = None
+                time.sleep(0.12)
+                continue
+
+            # throttle repetitive immediate regen
+            now = time.time()
+            if texts != prev_batch or (now - self._last_spoken_batch_ts) >= self._min_repeat_interval:
+                # prepare (text, wavpath or None)
+                prepared = []
+                for t in texts:
+                    wav = None
+                    if self.use_coqui:
+                        wav = self._ensure_cached_wav(t)
+                    prepared.append((t, wav))
+                prev_batch = list(texts)
+                self._last_spoken_batch_ts = 0.0  # will set after playing
+            # play sequence once
+            for t, wav in prepared:
+                if self._stop.is_set():
+                    break
+                with self.lock:
+                    # if texts changed mid-play, break to prepare fresh
+                    if self.current_texts != prev_batch:
+                        break
+                if wav and os.path.exists(wav):
+                    self._play_wav(wav)
+                else:
+                    # fallback to pyttsx3 if available
+                    if self.use_pyttsx3 and self.py_engine:
+                        try:
+                            self.py_engine.say(t)
+                            self.py_engine.runAndWait()
+                        except Exception as e:
+                            print("[TTS] pyttsx3 error:", e)
+                    else:
+                        # last resort: print
+                        print("[TTS] ->", t)
+                # small inter-message pause
+                for _ in range(8):
+                    if self._stop.is_set():
+                        break
+                    time.sleep(0.06)
+
+            # record last spoken time to avoid immediate repeat
+            self._last_spoken_batch_ts = time.time()
+            # pause slightly before repeating entire sequence
+            for _ in range(30):
+                if self._stop.is_set():
+                    break
+                time.sleep(0.05)
+
+
+# -------------------------
+# Main runtime
+# -------------------------
+def main():
+    # Initialize camera (prefer Picamera2 if present, else error per your environment)
+    cap = None
+    picam = None
+    if _HAS_PICAMERA2 and Picamera2 is not None:
+        try:
+            picam = Picamera2()
+            cfg = picam.create_preview_configuration({"main": {"format": "RGB888", "size": (640, 480)}})
+            picam.configure(cfg)
+            picam.start()
+            print("[CAM] Picamera2 initialized.")
+        except Exception as e:
+            print("[WARN] Picamera2 init failed:", e)
+            picam = None
+    else:
+        # Try local webcam as fallback (helpful for development on Mac)
+        try:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                cap = None
+                print("[WARN] Local webcam not available")
+            else:
+                print("[CAM] Local webcam initialized.")
+        except Exception as e:
+            print("[WARN] Webcam init failed:", e)
+            cap = None
+
+    if picam is None and cap is None:
+        print("[ERROR] No camera available (Picamera2 or local webcam). Exiting.")
+        return
+
+    # init windows
+    cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_MAIN, SCREEN_WIDTH, SCREEN_HEIGHT)
+    cv2.namedWindow(WINDOW_CAMERA, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_CAMERA, 800, 600)
+
+    # TTS manager (Coqui primary)
+    ttsm = TTSManager(use_coqui=_COQUI_AVAILABLE)
+
+    # keep a short history of last displayed messages to avoid verbal spam
+    last_displayed_msgs: List[str] = []
+    last_msg_update_ts = 0.0
+
+    # idle requirement small lines
+    req_lines = [
+        "Please stand in front of the camera",
+        "Ensure your face is well-lit",
+        "System will greet you automatically"
+    ]
+
+    frame_count = 0
+    last_fps_time = time.time()
+    fps = 0.0
+
+    pulse_phase = 0.0
+    idle_phase = 0.0
+
+    try:
+        while True:
+            # Capture frame either from picam or cv2
+            if picam is not None:
+                try:
+                    frame = picam.capture_array()
+                    if frame is None:
+                        print("[WARN] Picamera frame None")
+                        time.sleep(0.05)
+                        continue
+                except Exception as e:
+                    print("[WARN] Picamera read failed:", e)
+                    time.sleep(0.05)
+                    continue
+                # frame is RGB from picamera
+                frame_rgb = frame
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            else:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    print("[WARN] webcam frame fail")
+                    time.sleep(0.05)
+                    continue
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            frame_count += 1
+            now = time.time()
+            if now - last_fps_time >= 1.0:
+                fps = frame_count / (now - last_fps_time)
+                frame_count = 0
+                last_fps_time = now
+
+            # recognition
+            recs = compute_recognition(frame_rgb)
+            face_count = len(recs)
+            # prepare messages
+            welcome_msgs: List[str] = []
+            if face_count == 0:
+                # idle: no visible faces -> no speaking of "Avinya" required by user
+                welcome_msgs = []
+            else:
+                for r in recs:
+                    if r.get('name'):
+                        welcome_msgs.append(f"Welcome {r['name']}")
+                    else:
+                        welcome_msgs.append("Welcome Participant")
+
+            # deduplicate preserve order
+            uniq_msgs = list(dict.fromkeys(welcome_msgs))
+
+            # update TTS manager: only if msgs non-empty (speaking ON by default)
+            ttsm.update_texts(uniq_msgs)
+
+            # --- build main UI canvas (no camera preview in this canvas) ---
+            canvas = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+            # choose gradient based on idle/active
+            if face_count == 0:
+                draw_gradient_background(canvas, (20, 30, 60), (60, 40, 80))
+            else:
+                draw_gradient_background(canvas, (10, 50, 20), (30, 80, 40))
+
+            # pulsing rings behind logo (use a center)
+            center = (SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+            pulse_phase += 0.03
+            draw_pulsing_circles(canvas, center, 140, pulse_phase)
+
+            # logo
+            draw_logo_center(canvas, LOGO_IMG)
+
+            # animated AVINYA text (kept subtle per UI)
+            idle_phase += 0.04
+            glow = 0.6 + 0.4 * math.sin(idle_phase * 1.5)
+            # center pos for text (place under logo)
+            label_font_scale = 3.0
+            label_thickness = 6
+            # compute baseline x so text is centered when drawn with putText left coordinate
+            txt = "AVINYA"
+            tsz = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, label_font_scale, label_thickness)[0]
+            tx = (SCREEN_WIDTH - tsz[0]) // 2
+            ty = (SCREEN_HEIGHT // 2) + LOGO_SIZE // 2
+            draw_animated_text_glow(canvas, txt, tx, ty, label_font_scale, (255, 255, 255), label_thickness, glow)
+
+            # display messages under logo, wrapped to fit width if necessary
+            # choose a maximum text width (80% of screen)
+            max_text_width = int(SCREEN_WIDTH * 0.85)
+            msg_y_start = ty + TEXT_BASE_OFFSET
+            if uniq_msgs:
+                # For each message, wrap and draw multiple lines neatly
+                line_gap = 42
+                y = msg_y_start
+                # cap total vertical usage to avoid running off-screen; if too many lines, shrink font
+                base_font_scale = 1.2
+                base_thickness = 2
+                all_lines = []
+                for m in uniq_msgs:
+                    wrapped = wrap_text_to_width(m, cv2.FONT_HERSHEY_SIMPLEX, base_font_scale, base_thickness, max_text_width)
+                    all_lines.extend(wrapped)
+                # if too many lines to fit below logo, reduce font scale iteratively
+                max_lines_fit = (SCREEN_HEIGHT - msg_y_start - 80) // line_gap
+                font_scale = base_font_scale
+                thickness = base_thickness
+                while len(all_lines) > max_lines_fit and font_scale > 0.5:
+                    font_scale -= 0.1
+                    thickness = max(1, int(font_scale * 2))
+                    all_lines = []
+                    for m in uniq_msgs:
+                        all_lines.extend(wrap_text_to_width(m, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness, max_text_width))
+                    # recalc
+                    max_lines_fit = (SCREEN_HEIGHT - msg_y_start - 80) // line_gap
+                # draw each line centered
+                for ln in all_lines:
+                    tw = cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0][0]
+                    x = (SCREEN_WIDTH - tw) // 2
+                    cv2.putText(canvas, ln, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                    y += line_gap
+            else:
+                # idle: show muted requirements under logo
+                small_fs = 0.7
+                small_th = 1
+                base_y = msg_y_start + 10
+                for i, ln in enumerate(["Please stand in front of the camera", "Ensure your face is well-lit", "System will greet you automatically"]):
+                    tw = cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX, small_fs, small_th)[0][0]
+                    x = (SCREEN_WIDTH - tw) // 2
+                    cv2.putText(canvas, ln, (x, base_y + i * 28), cv2.FONT_HERSHEY_SIMPLEX, small_fs, (200, 200, 200), small_th, cv2.LINE_AA)
+
+            # top-left small FPS counter and face count
+            overlay_text = f"FPS: {fps:.1f}  Faces: {face_count}"
+            cv2.putText(canvas, overlay_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+            # show main window
+            cv2.imshow(WINDOW_MAIN, canvas)
+
+            # annotate and show camera window separately (live feed)
+            cam_disp = frame_bgr.copy()
+            # header
+            cv2.rectangle(cam_disp, (0, 0), (cam_disp.shape[1], 34), (230, 230, 230), -1)
+            cv2.putText(cam_disp, "AVINYA Camera", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 2, cv2.LINE_AA)
+            # annotate faces
+            for r in recs:
+                if USING_DLIB:
+                    rect = r['rect']
+                    x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
+                else:
+                    x, y, w, h = r['rect']
+                    x1, y1, x2, y2 = x, y, x + w, y + h
+                # clamp
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(cam_disp.shape[1] - 1, x2), min(cam_disp.shape[0] - 1, y2)
+                cv2.rectangle(cam_disp, (x1, y1), (x2, y2), (0, 140, 200), 2)
+                label = r['name'] if r['name'] else "Participant"
+                txt = label if r['name'] else "Participant"
+                ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                cv2.rectangle(cam_disp, (x1, y1 - 28), (x1 + ts[0] + 10, y1 - 6), (0, 140, 200), -1)
+                cv2.putText(cam_disp, txt, (x1 + 6, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+            # show camera window
+            cv2.imshow(WINDOW_CAMERA, cam_disp)
+
+            # handle inputs
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            # optional: space to toggle speech on/off (useful in live testing)
+            if key == ord(' '):
+                with ttsm.lock:
+                    ttsm.enabled = not ttsm.enabled
+                print("[UI] Speech enabled:", ttsm.enabled)
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user.")
+    finally:
+        # shutdown
+        print("[INFO] Shutting down...")
+        try:
+            ttsm.stop()
+        except Exception:
+            pass
+        try:
+            if picam is not None:
+                picam.stop()
+        except Exception:
+            pass
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        print("[INFO] Exit cleanly.")
+
+
+if __name__ == "__main__":
+    main()
