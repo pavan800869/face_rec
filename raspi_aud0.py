@@ -413,7 +413,7 @@ try:
                     if min_dist < 0.6:
                         text = f"{name} ({min_dist:.2f})"
                         # Updated welcome message for recognized people
-                        welcome_texts.append(f"Thank you {name}, welcome to AVINYA 2K25")
+                        welcome_texts.append(f"Thank you {name}, Welcome to AVINYA 2025")
                     else:
                         text = "Unknown"
                         # Updated message for unknown people
