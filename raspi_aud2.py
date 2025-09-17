@@ -13,11 +13,15 @@ import sys
 import time
 import threading
 import hashlib
+import shutil
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
+
+# Add system packages path for picamera2
+sys.path.append('/usr/lib/python3/dist-packages')
 
 # --- optional libraries ---
 try:
@@ -41,76 +45,116 @@ except Exception:
 
 # PiCamera2 import
 try:
-    from picamera2 import Picamera2, Preview
+    from picamera2 import Picamera2
     PICAMERA_AVAILABLE = True
-except Exception:
+except Exception as e:
+    print(f"[ERROR] picamera2 not available: {e}")
+    print("Install with: sudo apt install python3-picamera2")
     PICAMERA_AVAILABLE = False
 
 # -----------------------
-# Config
+# Configuration
 # -----------------------
-SCREEN_WIDTH, SCREEN_HEIGHT = 1200, 600
+SCREEN_WIDTH = 1200
+SCREEN_HEIGHT = 600
+
 LOGO_SIZE = 280
-MATCH_THRESHOLD = 0.6
+LOGO_COLOR = (20, 40, 80)  # BGR
+BG_COLOR_TOP = (245, 247, 250)
+BG_COLOR_BOTTOM = (255, 255, 255)
+
+MATCH_THRESHOLD = 0.60
+
 USE_COQUI = True and _COQUI_AVAILABLE
 COQUI_MODEL_NAME = "tts_models/en/ljspeech/tacotron2-DDC"
 COQUI_SPEED = 0.95
 TTS_CACHE_DIR = Path("tts_cache")
 TTS_CACHE_DIR.mkdir(exist_ok=True)
 
+FEATURES_CSV = Path("data/features_all.csv")
+DLIB_PREDICTOR = Path("data_dlib/shape_predictor_68_face_landmarks.dat")
+DLIB_FACEREC = Path("data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+
+WINDOW_MAIN = "AVINYA - Welcome"
+WINDOW_CAMERA = "AVINYA - Camera"
+
 # -----------------------
 # Helpers
 # -----------------------
+def platform_player_command(path: str) -> Optional[str]:
+    """Return a shell command to play a wav file for the current platform, or None."""
+    if sys.platform.startswith("linux"):
+        if shutil.which("aplay"):
+            return f'aplay "{path}"'
+        if shutil.which("ffplay"):
+            return f'ffplay -nodisp -autoexit -loglevel quiet "{path}"'
+        if shutil.which("cvlc"):
+            return f'cvlc --play-and-exit --intf dummy "{path}"'
+    elif sys.platform.startswith("darwin"):
+        if shutil.which("afplay"):
+            return f'afplay "{path}"'
+    return None
+
 def sha1_hex(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-def platform_player_command(path: str):
-    if sys.platform.startswith("linux"):
-        if os.system("which aplay > /dev/null 2>&1") == 0:
-            return f"aplay {path}"
-        if os.system("which ffplay > /dev/null 2>&1") == 0:
-            return f"ffplay -nodisp -autoexit -loglevel quiet {path}"
-    elif sys.platform.startswith("darwin"):
-        return f"afplay {path}"
-    return None
-
 # -----------------------
-# Logo & UI
+# Logo & drawing
 # -----------------------
-def make_logo_image(size=LOGO_SIZE):
-    logo = np.full((size, size, 3), 255, np.uint8)
+def make_logo_image(size: int = LOGO_SIZE) -> np.ndarray:
+    logo = np.full((size, size, 3), 255, dtype=np.uint8)
     cx, cy = size // 2, size // 2
-    cv2.circle(logo, (cx, cy), size//2 - 4, (230, 230, 235), -1)
-    cv2.circle(logo, (cx, cy), size//2 - 18, (245, 247, 250), -1)
-    cv2.circle(logo, (cx, cy), size//8, (20, 40, 80), -1)
-    # label
+    cv2.circle(logo, (cx, cy), size // 2 - 4, (230, 230, 235), -1)
+    cv2.circle(logo, (cx, cy), size // 2 - 18, (245, 247, 250), -1)
+    cv2.circle(logo, (cx, cy), size // 8, LOGO_COLOR, -1)
+    # small AVINYA label beneath center symbol
     text = "AVINYA"
-    ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size/300.0, 2)[0]
-    cv2.putText(logo, text, (cx - ts[0]//2, cy + size//3),
-                cv2.FONT_HERSHEY_SIMPLEX, size/300.0, (20,40,80), 2, cv2.LINE_AA)
+    font_scale = size / 300.0
+    thickness = max(1, int(font_scale * 2.5))
+    ts = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+    tx = cx - ts[0] // 2
+    ty = cy + size // 3
+    cv2.putText(logo, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, LOGO_COLOR, thickness, cv2.LINE_AA)
     return logo
 
 LOGO_IMG = make_logo_image(LOGO_SIZE)
 
-def draw_background(canvas):
+def draw_background(canvas: np.ndarray):
     h, w = canvas.shape[:2]
     for i in range(h):
-        alpha = i/h
-        col = tuple([int(245*(1-alpha) + 255*alpha),
-                     int(247*(1-alpha) + 255*alpha),
-                     int(250*(1-alpha) + 255*alpha)])
-        canvas[i,:,:] = col
+        alpha = i / float(h)
+        col = (
+            int(BG_COLOR_TOP[0] * (1 - alpha) + BG_COLOR_BOTTOM[0] * alpha),
+            int(BG_COLOR_TOP[1] * (1 - alpha) + BG_COLOR_BOTTOM[1] * alpha),
+            int(BG_COLOR_TOP[2] * (1 - alpha) + BG_COLOR_BOTTOM[2] * alpha),
+        )
+        canvas[i, :, :] = col
 
-def draw_logo_center(canvas):
+def draw_logo_center(canvas: np.ndarray, logo_img: np.ndarray):
     h, w = canvas.shape[:2]
-    lh, lw = LOGO_IMG.shape[:2]
-    canvas[(h-lh)//2:(h+lh)//2, (w-lw)//2:(w+lw)//2] = LOGO_IMG
+    lh, lw = logo_img.shape[:2]
+    x = (w - lw) // 2
+    y = (h - lh) // 2 - 40
+    # subtle drop shadow
+    sh_offset = 8
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (x + sh_offset + 10, y + sh_offset + 10),
+                  (x + lw - 10, y + lh - 10), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.06, canvas, 0.94, 0, canvas)
+    canvas[y:y+lh, x:x+lw] = logo_img
+
+def draw_requirements(canvas: np.ndarray, lines: List[str]):
+    h, w = canvas.shape[:2]
+    base_y = (h + LOGO_SIZE) // 2 + 10
+    for i, ln in enumerate(lines):
+        ts = cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
+        x = (w - ts[0]) // 2
+        y = base_y + i * 28
+        cv2.putText(canvas, ln, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 1, cv2.LINE_AA)
 
 # -----------------------
-# Recognition placeholder (same as before)
+# Recognition helpers
 # -----------------------
-# Here you would keep the compute_recognition() function exactly as before
-# using dlib or Haar cascade. Omitted for brevity.
 if FEATURES_CSV.exists():
     try:
         import pandas as pd
@@ -168,16 +212,15 @@ def compute_recognition(frame_rgb: np.ndarray):
             except Exception as e:
                 print("[WARN] descriptor error:", e)
     else:
-        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
         dets = _detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5)
         for (x,y,w,h) in dets:
             results.append({'rect': (x,y,w,h), 'name': None, 'dist': 1.0})
     return results
 
 # -----------------------
-# TTS Manager (same as before)
+# TTS manager
 # -----------------------
-# Keep TTSManager class exactly as in your original code
 class TTSManager:
     """
     Caches WAV files for Coqui TTS, plays them in a loop while enabled.
@@ -313,65 +356,156 @@ class TTSManager:
 def main():
     if not PICAMERA_AVAILABLE:
         print("[ERROR] picamera2 not available")
+        print("Install with: sudo apt install python3-picamera2")
         return
 
-    picam2 = Picamera2()
-    config = picam2.create_preview_configuration(main={"format": "XRGB8888", "size": (640, 480)})
-    picam2.configure(config)
-    picam2.start()
+    # Initialize PiCamera2 with proper configuration
+    try:
+        picam2 = Picamera2()
+        config = picam2.create_preview_configuration(
+            main={"format": "RGB888", "size": (640, 480)},
+            display="main"
+        )
+        picam2.configure(config)
+        picam2.start()
+        
+        # Allow camera to warm up
+        time.sleep(2)
+        print("[INFO] PiCamera2 initialized successfully")
+        
+    except Exception as e:
+        print(f"[ERROR] PiCamera2 initialization failed: {e}")
+        print("Make sure:")
+        print("1. Camera is enabled: sudo raspi-config > Interface Options > Camera")
+        print("2. picamera2 is installed: sudo apt install python3-picamera2")
+        print("3. You have proper permissions")
+        return
 
-    cv2.namedWindow("AVINYA - Main", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("AVINYA - Main", SCREEN_WIDTH, SCREEN_HEIGHT)
-    cv2.namedWindow("AVINYA - Camera", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("AVINYA - Camera", 800, 600)
+    cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_MAIN, SCREEN_WIDTH, SCREEN_HEIGHT)
+    cv2.namedWindow(WINDOW_CAMERA, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_CAMERA, 800, 600)
 
+    # TTS always ON by default
     tts = TTSManager(use_coqui=USE_COQUI)
 
+    # requirements text shown on idle
     req_lines = [
         "Please stand in front of the camera",
         "Ensure your face is well-lit"
     ]
 
+    last_time = time.time()
+    fps = 0.0
+    frame_count = 0
+
     try:
         while True:
-            frame = picam2.capture_array()
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            recs = compute_recognition(frame_rgb)
-            faces_present = len(recs) > 0
+            try:
+                # Capture frame from PiCamera2 (returns RGB format)
+                frame_rgb = picam2.capture_array()
+                
+                frame_count += 1
+                now = time.time()
+                if now - last_time >= 1.0:
+                    fps = frame_count / (now - last_time)
+                    frame_count = 0
+                    last_time = now
 
-            canvas = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), np.uint8)
-            draw_background(canvas)
-            draw_logo_center(canvas)
+                # recognition uses RGB directly from picamera2
+                recs = compute_recognition(frame_rgb)
+                faces_present = len(recs) > 0
 
-            welcome_msgs = []
-            if faces_present:
-                for r in recs:
-                    name = r['name'] if r['name'] else "Participant"
-                    welcome_msgs.append(f"Welcome {name}")
-                uniq = list(dict.fromkeys(welcome_msgs))
-                tts.update_texts(uniq)
-            else:
-                tts.update_texts([])
-            cv2.imshow("AVINYA - Main", canvas)
+                # MAIN CANVAS (no camera preview)
+                canvas = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+                draw_background(canvas)
+                draw_logo_center(canvas, LOGO_IMG)
 
-            cam_display = frame.copy()
-            for rec in recs:
-                if hasattr(rec['rect'], 'left'):
-                    r = rec['rect']
-                    x1, y1, x2, y2 = r.left(), r.top(), r.right(), r.bottom()
+                # detection & messages
+                welcome_msgs = []
+                if faces_present:
+                    # prepare messages
+                    for rec in recs:
+                        if rec['name']:
+                            welcome_msgs.append(f"Welcome {rec['name']}")
+                        else:
+                            welcome_msgs.append("Welcome Participant")
+                    # display unique messages beneath the logo
+                    uniq = list(dict.fromkeys(welcome_msgs))
+                    base_y = (SCREEN_HEIGHT + LOGO_SIZE) // 2
+                    for i, msg in enumerate(uniq):
+                        y = base_y + 40 + i * 46
+                        ts = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)[0]
+                        x = (SCREEN_WIDTH - ts[0]) // 2
+                        cv2.putText(canvas, msg, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1.2, LOGO_COLOR, 2, cv2.LINE_AA)
+                    # update TTS with texts (TTSManager filters "avinya")
+                    tts.update_texts(uniq)
                 else:
-                    x, y, w, h = rec['rect']
-                    x1, y1, x2, y2 = x, y, x + w, y + h
-                cv2.rectangle(cam_display, (x1,y1), (x2,y2), (0,140,200), 2)
-            cv2.imshow("AVINYA - Camera", cam_display)
+                    # idle: show small requirements
+                    draw_requirements(canvas, req_lines)
+                    tts.update_texts([])
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
-                break
+                # fps small
+                cv2.putText(canvas, f"FPS: {fps:.1f}", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (90,90,90), 1)
+
+                cv2.imshow(WINDOW_MAIN, canvas)
+
+                # CAMERA WINDOW: show live feed with annotations (separate)
+                # Convert RGB to BGR for OpenCV display
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                cam_display = frame_bgr.copy()
+                
+                # draw header
+                cv2.rectangle(cam_display, (0,0), (cam_display.shape[1], 34), (230,230,230), -1)
+                cv2.putText(cam_display, "AVINYA Camera", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30,30,30), 2)
+                
+                # annotate faces
+                for rec in recs:
+                    if USING_DLIB:
+                        r = rec['rect']
+                        x1, y1, x2, y2 = r.left(), r.top(), r.right(), r.bottom()
+                    else:
+                        x, y, w, h = rec['rect']
+                        x1, y1, x2, y2 = x, y, x + w, y + h
+                    # clamp
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(cam_display.shape[1]-1, x2), min(cam_display.shape[0]-1, y2)
+                    color = (0, 140, 200)
+                    cv2.rectangle(cam_display, (x1, y1), (x2, y2), color, 2)
+                    label = rec['name'] if rec['name'] else "Participant"
+                    ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                    cv2.rectangle(cam_display, (x1, y1 - 28), (x1 + ts[0] + 10, y1 - 6), color, -1)
+                    cv2.putText(cam_display, label, (x1 + 6, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
+                cv2.imshow(WINDOW_CAMERA, cam_display)
+
+                # input handling: 'q' or ESC to quit
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:
+                    break
+                    
+            except Exception as e:
+                print(f"[ERROR] Frame processing error: {e}")
+                continue
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user.")
     finally:
-        tts.stop()
-        picam2.stop()
-        cv2.destroyAllWindows()
+        print("[INFO] Shutting down...")
+        try:
+            tts.stop()
+        except Exception:
+            pass
+        try:
+            picam2.stop()
+            print("[INFO] Camera stopped")
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        print("[INFO] Exit cleanly.")
 
 if __name__ == "__main__":
     main()
