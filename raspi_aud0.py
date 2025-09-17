@@ -479,13 +479,15 @@ def main():
     if _HAS_PICAMERA2 and Picamera2 is not None:
         try:
             picam = Picamera2()
-            cfg = picam.create_preview_configuration({"main": {"format": "RGB888", "size": (640, 480)}})
+            # ✅ Only use "size", not "format"
+            cfg = picam.create_preview_configuration(main={"size": (640, 480)})
             picam.configure(cfg)
             picam.start()
             print("[CAM] Picamera2 initialized.")
         except Exception as e:
             print("[WARN] Picamera2 init failed:", e)
             picam = None
+
     else:
         # Try local webcam as fallback (helpful for development on Mac)
         try:
