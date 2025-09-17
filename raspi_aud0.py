@@ -59,10 +59,10 @@ except Exception:
     pyttsx3 = None
     _PYTTX3_AVAILABLE = False
 
+sys.path.append('/usr/lib/python3/dist-packages')
 # picamera2 (for Raspberry Pi) — keep for environments that use it
 try:
     # allow nonstandard package path if needed (your environment may not need this)
-    sys.path.append('/usr/lib/python3/dist-packages')
     from picamera2 import Picamera2
     _HAS_PICAMERA2 = True
 except Exception:
