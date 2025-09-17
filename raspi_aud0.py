@@ -280,44 +280,101 @@ def draw_auto_fitted_text(canvas, text, y_position, max_width, color=(255, 255, 
     # Draw text with glow
     draw_animated_text(canvas, text, (text_x, y_position), font_scale, color, thickness)
 
-def draw_modern_button(canvas, rect, text, is_hovered=False):
-    """Draw a modern gradient button with shadow"""
-    x1, y1, x2, y2 = rect
+def compute_face_descriptor_with_validation(frame_rgb, shape):
+    """Compute face descriptor with additional validation"""
+    try:
+        # Check if we have enough landmarks
+        landmarks = np.array([(shape.part(i).x, shape.part(i).y) for i in range(68)])
+        
+        # Basic validation - check if landmarks are reasonable
+        face_width = np.max(landmarks[:, 0]) - np.min(landmarks[:, 0])
+        face_height = np.max(landmarks[:, 1]) - np.min(landmarks[:, 1])
+        
+        # Skip very small or very large detections
+        if face_width < 30 or face_height < 30 or face_width > 500 or face_height > 500:
+            return None
+            
+        # Check landmark quality - eyes should be reasonably aligned
+        left_eye = np.mean(landmarks[36:42], axis=0)
+        right_eye = np.mean(landmarks[42:48], axis=0)
+        eye_distance = np.linalg.norm(right_eye - left_eye)
+        
+        # Skip if eyes are too close or too far (poor detection)
+        if eye_distance < 20 or eye_distance > 200:
+            return None
+            
+        descriptor = facerec.compute_face_descriptor(frame_rgb, shape)
+        return np.array(descriptor)
+    except Exception as e:
+        print(f"[DEBUG] Face descriptor computation failed: {e}")
+        return None
+
+def recognize_face_improved(face_descriptor, df, confidence_threshold=0.45, top_k_validation=3):
+    """Improved face recognition with multiple validation steps"""
+    if face_descriptor is None:
+        return "Unknown", 1.0
     
-    # Button shadow
-    shadow_offset = 5
-    cv2.rectangle(canvas, (x1 + shadow_offset, y1 + shadow_offset), 
-                 (x2 + shadow_offset, y2 + shadow_offset), (30, 30, 30), -1)
+    # Compute distances to all known faces
+    distances = []
+    for i in range(len(df)):
+        person_name = df.index[i]
+        person_features = np.array(df.iloc[i].values)
+        
+        # Use Euclidean distance
+        euclidean_dist = np.linalg.norm(person_features - face_descriptor)
+        
+        # Also compute cosine similarity for additional validation
+        cosine_sim = np.dot(person_features, face_descriptor) / (
+            np.linalg.norm(person_features) * np.linalg.norm(face_descriptor)
+        )
+        cosine_dist = 1 - cosine_sim
+        
+        # Combined score (weighted average)
+        combined_dist = 0.7 * euclidean_dist + 0.3 * cosine_dist
+        
+        distances.append((person_name, euclidean_dist, cosine_dist, combined_dist))
     
-    # Button gradient
-    button_height = y2 - y1
-    if is_hovered:
-        color1, color2 = (0, 220, 0), (0, 150, 0)
-    else:
-        color1, color2 = (0, 180, 0), (0, 120, 0)
+    # Sort by combined distance
+    distances.sort(key=lambda x: x[3])
     
-    for i in range(button_height):
-        alpha = i / button_height
-        blended_color = [
-            int(color1[j] * (1 - alpha) + color2[j] * alpha) 
-            for j in range(3)
-        ]
-        cv2.line(canvas, (x1, y1 + i), (x2, y1 + i), blended_color, 1)
+    best_match = distances[0]
+    name, euclidean_dist, cosine_dist, combined_dist = best_match
     
-    # Button border
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
+    # Multi-stage validation
     
-    # Button text with shadow
-    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3)[0]
-    text_x = x1 + (x2 - x1 - text_size[0]) // 2
-    text_y = y1 + (y2 - y1 + text_size[1]) // 2
+    # Stage 1: Primary threshold check
+    if combined_dist > confidence_threshold:
+        return "Unknown", combined_dist
     
-    # Text shadow
-    cv2.putText(canvas, text, (text_x + 2, text_y + 2), 
-               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3, cv2.LINE_AA)
-    # Main text
-    cv2.putText(canvas, text, (text_x, text_y), 
-               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
+    # Stage 2: Check if the best match is significantly better than the second best
+    if len(distances) > 1:
+        second_best_dist = distances[1][3]
+        margin = second_best_dist - combined_dist
+        
+        # Require a minimum margin to avoid false positives
+        min_margin = 0.1
+        if margin < min_margin:
+            return "Unknown", combined_dist
+    
+    # Stage 3: Check consistency across top matches
+    # If multiple people are very close, it's likely unknown
+    top_k_matches = distances[:min(top_k_validation, len(distances))]
+    top_k_distances = [match[3] for match in top_k_matches]
+    
+    # Check if there's a clear winner
+    std_dev = np.std(top_k_distances)
+    if std_dev < 0.05:  # Too many similar matches - probably unknown
+        return "Unknown", combined_dist
+    
+    # Stage 4: Additional euclidean distance check
+    if euclidean_dist > 0.5:  # Conservative euclidean threshold
+        return "Unknown", combined_dist
+    
+    # Stage 5: Cosine similarity check
+    if cosine_dist > 0.4:  # Conservative cosine threshold
+        return "Unknown", combined_dist
+    
+    return name, combined_dist
 
 # 📂 Load face embeddings
 try:
@@ -341,26 +398,10 @@ except Exception as e:
 
 print("[INFO] Starting real-time recognition with PiCamera2...")
 
-welcome_texts = []
-button_coords = (SCREEN_WIDTH//2 - 120, SCREEN_HEIGHT - 100, SCREEN_WIDTH//2 + 120, SCREEN_HEIGHT - 40)
-mouse_pos = (0, 0)
-
-# 🖱️ Mouse callback for Speak button and hover effects
-def mouse_callback(event, x, y, flags, param):
-    global welcome_texts, mouse_pos
-    mouse_pos = (x, y)
-    
-    if event == cv2.EVENT_LBUTTONDOWN:
-        x1, y1, x2, y2 = button_coords
-        if x1 <= x <= x2 and y1 <= y <= y2:
-            if welcome_texts:
-                tts_cache.update_texts(welcome_texts)
-
+# Create windows
 cv2.namedWindow("AVINYA - Welcome System", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("AVINYA - Welcome System", SCREEN_WIDTH, SCREEN_HEIGHT)
-cv2.setMouseCallback("AVINYA - Welcome System", mouse_callback)
 
-# Create face recognition window
 cv2.namedWindow("Face Recognition", cv2.WINDOW_NORMAL)
 cv2.resizeWindow("Face Recognition", 640, 480)
 cv2.moveWindow("Face Recognition", 0, 0)
@@ -369,6 +410,8 @@ cv2.moveWindow("Face Recognition", 0, 0)
 frame_count = 0
 pulse_time = 0
 idle_animation_time = 0
+face_stable_count = {}  # Track face stability over multiple frames
+min_stable_frames = 5   # Minimum frames for stable recognition
 
 try:
     while True:
@@ -385,7 +428,8 @@ try:
             # Use RGB for dlib processing (dlib expects RGB)
             frame_rgb = frame  # picamera2 already gives RGB
             
-            faces = detector(frame_rgb, 0)
+            # Detect faces with improved parameters
+            faces = detector(frame_rgb, 1)  # Increased upsampling for better detection
             
             welcome_texts = []
             is_idle = len(faces) == 0
@@ -393,59 +437,103 @@ try:
             if is_idle:
                 # Stop TTS when idle
                 tts_cache.stop()
+                # Reset face stability tracking
+                face_stable_count.clear()
             else:
-                for face in faces:
+                current_frame_faces = {}
+                
+                for i, face in enumerate(faces):
+                    # Validate face size
+                    face_width = face.right() - face.left()
+                    face_height = face.bottom() - face.top()
+                    
+                    # Skip very small faces (likely false positives)
+                    if face_width < 80 or face_height < 80:
+                        continue
+                    
                     shape = predictor(frame_rgb, face)
-                    face_descriptor = facerec.compute_face_descriptor(frame_rgb, shape)
-                    face_descriptor = np.array(face_descriptor)
+                    face_descriptor = compute_face_descriptor_with_validation(frame_rgb, shape)
                     
-                    # Compare with dataset
-                    distances = []
-                    for i in range(len(df)):
-                        person_name = df.index[i]
-                        person_features = np.array(df.iloc[i].values)
-                        dist = np.linalg.norm(person_features - face_descriptor)
-                        distances.append((person_name, dist))
+                    if face_descriptor is None:
+                        continue
                     
-                    best_match = min(distances, key=lambda x: x[1])
-                    name, min_dist = best_match
+                    # Improved face recognition
+                    name, confidence = recognize_face_improved(face_descriptor, df)
                     
-                    if min_dist < 0.6:
-                        text = f"{name} ({min_dist:.2f})"
-                        # Updated welcome message for recognized people
-                        welcome_texts.append(f"Thank you {name}, Welcome to AVINYA 2025")
+                    # Track face stability
+                    face_key = f"face_{i}"
+                    if face_key not in face_stable_count:
+                        face_stable_count[face_key] = {"name": name, "count": 1, "confidence": confidence}
                     else:
-                        text = "Unknown"
-                        # Updated message for unknown people
-                        welcome_texts.append("Welcome Participant")
+                        if face_stable_count[face_key]["name"] == name:
+                            face_stable_count[face_key]["count"] += 1
+                        else:
+                            # Name changed, reset counter
+                            face_stable_count[face_key] = {"name": name, "count": 1, "confidence": confidence}
                     
-                    # Draw enhanced face rectangle
+                    current_frame_faces[face_key] = True
+                    
+                    # Only use stable recognitions
+                    stable_name = name
+                    if face_stable_count[face_key]["count"] >= min_stable_frames:
+                        stable_name = face_stable_count[face_key]["name"]
+                    else:
+                        stable_name = "Verifying..."
+                    
+                    # Display logic
+                    if stable_name != "Verifying..." and stable_name != "Unknown":
+                        text = f"{stable_name} ({confidence:.2f})"
+                        color = (0, 255, 0)  # Green for recognized
+                        # Updated welcome message for recognized people
+                        if face_stable_count[face_key]["count"] >= min_stable_frames:
+                            welcome_texts.append(f"Thank you {stable_name}, Welcome to AVINYA 2025")
+                    elif stable_name == "Unknown":
+                        text = f"Unknown ({confidence:.2f})"
+                        color = (0, 165, 255)  # Orange for unknown
+                        # Updated message for unknown people
+                        if face_stable_count[face_key]["count"] >= min_stable_frames:
+                            welcome_texts.append("Welcome Participant")
+                    else:
+                        text = stable_name
+                        color = (255, 255, 0)  # Yellow for verifying
+                    
+                    # Draw enhanced face rectangle with color coding
                     cv2.rectangle(frame_bgr, (face.left()-5, face.top()-5), 
-                                 (face.right()+5, face.bottom()+5), (0, 255, 0), 3)
+                                 (face.right()+5, face.bottom()+5), color, 3)
                     cv2.rectangle(frame_bgr, (face.left()-2, face.top()-2), 
                                  (face.right()+2, face.bottom()+2), (255, 255, 255), 1)
                     
                     # Enhanced text with background
-                    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
                     cv2.rectangle(frame_bgr, (face.left(), face.top() - 35), 
                                  (face.left() + text_size[0] + 10, face.top() - 5), 
                                  (0, 0, 0), -1)
                     cv2.putText(frame_bgr, text, (face.left() + 5, face.top() - 15),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    
+                    # Show stability indicator
+                    stability_text = f"Stable: {face_stable_count[face_key]['count']}/{min_stable_frames}"
+                    cv2.putText(frame_bgr, stability_text, (face.left() + 5, face.bottom() + 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                 
-                # Update TTS with welcome messages
+                # Clean up face tracking for faces that are no longer detected
+                face_stable_count = {k: v for k, v in face_stable_count.items() if k in current_frame_faces}
+                
+                # Update TTS with welcome messages only for stable recognitions
                 if welcome_texts:
                     tts_cache.update_texts(welcome_texts)
             
-            # Add frame counter with modern styling
-            cv2.rectangle(frame_bgr, (5, 5), (150, 35), (0, 0, 0), -1)
+            # Add enhanced frame counter with recognition stats
+            cv2.rectangle(frame_bgr, (5, 5), (250, 60), (0, 0, 0), -1)
             cv2.putText(frame_bgr, f"Frame: {frame_count}", (10, 25), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(frame_bgr, f"Faces: {len(faces)}, Stable: {len([v for v in face_stable_count.values() if v['count'] >= min_stable_frames])}", 
+                       (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             
             # Show face recognition window
             cv2.imshow("Face Recognition", frame_bgr)
             
-            # 🎯 Main Welcome Screen with enhanced UI
+            # 🎯 Main Welcome Screen with enhanced UI (NO BUTTON)
             welcome_canvas = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
             
             if is_idle:
@@ -501,13 +589,6 @@ try:
                 for i, msg in enumerate(welcome_texts):
                     y = y_start + i * 100
                     draw_auto_fitted_text(welcome_canvas, msg, y, max_text_width)
-            
-            # Check if mouse is hovering over button
-            x1, y1, x2, y2 = button_coords
-            is_hovered = x1 <= mouse_pos[0] <= x2 and y1 <= mouse_pos[1] <= y2
-            
-            # Draw modern speak button
-            draw_modern_button(welcome_canvas, button_coords, "SPEAK", is_hovered)
             
             # Add corner decorations
             corner_size = 50
